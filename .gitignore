@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+data/*.jsonl
+!data/knowledge_base.jsonl
+
+# Never commit runtime data or credentials
+*.db
+*.sqlite
+.env
+.env.*
+*.pem
+*.key
+kubeconfig*

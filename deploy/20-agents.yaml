@@ -1,0 +1,405 @@
+# The four agents: same image, different role and ServiceAccount (see 10-rbac.yaml).
+# monitor: Notices failing pods, captures redacted evidence, opens Incidents. Serves the console.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-monitor
+  namespace: aiops-system
+  labels:
+    app: aiops-monitor
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # exactly one instance per role
+  selector:
+    matchLabels:
+      app: aiops-monitor
+  template:
+    metadata:
+      labels:
+        app: aiops-monitor
+        app.kubernetes.io/part-of: aiops-v2
+        aiops.homelab.dev/agent: monitor
+    spec:
+      serviceAccountName: aiops-monitor
+      priorityClassName: homelab-platform
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: aiops-v2:local
+          imagePullPolicy: Never
+          args: ["monitor"]
+          env:
+            - name: AIOPS_SYSTEM_NAMESPACE
+              value: "aiops-system"
+            - name: AIOPS_ALL_NAMESPACES
+              value: "false"
+            - name: AIOPS_NAMESPACES
+              value: "aiops-demo,travel,github"
+            - name: AIOPS_POLL_INTERVAL
+              value: "15"
+            - name: AIOPS_INCIDENT_COOLDOWN
+              value: "600"
+            - name: AIOPS_RETENTION_DAYS
+              value: "7"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {cpu: 300m, memory: 192Mi}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-monitor
+  namespace: aiops-system
+  labels:
+    app: aiops-monitor
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  selector:
+    app: aiops-monitor
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# diagnose: Rules -> Lessons -> web search + LLM + judge. No Kubernetes rights outside aiops-system.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-diagnose
+  namespace: aiops-system
+  labels:
+    app: aiops-diagnose
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # exactly one instance per role
+  selector:
+    matchLabels:
+      app: aiops-diagnose
+  template:
+    metadata:
+      labels:
+        app: aiops-diagnose
+        app.kubernetes.io/part-of: aiops-v2
+        aiops.homelab.dev/agent: diagnose
+    spec:
+      serviceAccountName: aiops-diagnose
+      priorityClassName: homelab-platform
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: aiops-v2:local
+          imagePullPolicy: Never
+          args: ["diagnose"]
+          env:
+            - name: AIOPS_SYSTEM_NAMESPACE
+              value: "aiops-system"
+            - name: AIOPS_ALL_NAMESPACES
+              value: "false"
+            - name: AIOPS_NAMESPACES
+              value: "aiops-demo,travel,github"
+            - name: AIOPS_POLL_INTERVAL
+              value: "15"
+            - name: AIOPS_IMAGE_FALLBACKS
+              value: "nginx=nginx:1.27-alpine,busybox=busybox:1.36"
+            - name: AIOPS_ENV_DEFAULTS
+              value: "DB_HOST=db.aiops-demo.svc.cluster.local"
+            - name: AIOPS_LLM_ENABLED
+              value: "true"
+            - name: AIOPS_OLLAMA_ENDPOINT
+              value: "http://ollama.aiops-demo.svc.cluster.local:11434"
+            - name: AIOPS_OLLAMA_MODEL
+              value: "qwen3.5:4b"
+            - name: AIOPS_LLM_TIMEOUT
+              value: "120"
+            - name: AIOPS_LLM_MIN_CONFIDENCE
+              value: "0.6"
+            - name: AIOPS_WEB_SEARCH
+              value: "true"
+            - name: AIOPS_LLM_AUTO_FIX
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-diagnose
+  namespace: aiops-system
+  labels:
+    app: aiops-diagnose
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  selector:
+    app: aiops-diagnose
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# repair: Rebuilds each proposal from the catalog against the live Deployment, pre-checks, patches, rolls back.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-repair
+  namespace: aiops-system
+  labels:
+    app: aiops-repair
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # exactly one instance per role
+  selector:
+    matchLabels:
+      app: aiops-repair
+  template:
+    metadata:
+      labels:
+        app: aiops-repair
+        app.kubernetes.io/part-of: aiops-v2
+        aiops.homelab.dev/agent: repair
+    spec:
+      serviceAccountName: aiops-repair
+      priorityClassName: homelab-platform
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: aiops-v2:local
+          imagePullPolicy: Never
+          args: ["repair"]
+          env:
+            - name: AIOPS_SYSTEM_NAMESPACE
+              value: "aiops-system"
+            - name: AIOPS_ALL_NAMESPACES
+              value: "false"
+            - name: AIOPS_NAMESPACES
+              value: "aiops-demo,travel,github"
+            - name: AIOPS_POLL_INTERVAL
+              value: "15"
+            - name: AIOPS_IMAGE_FALLBACKS
+              value: "nginx=nginx:1.27-alpine,busybox=busybox:1.36"
+            - name: AIOPS_ENV_DEFAULTS
+              value: "DB_HOST=db.aiops-demo.svc.cluster.local"
+            - name: AIOPS_AUTO_FIX
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 10m, memory: 48Mi}
+            limits: {cpu: 300m, memory: 192Mi}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-repair
+  namespace: aiops-system
+  labels:
+    app: aiops-repair
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  selector:
+    app: aiops-repair
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# validate: Waits for rollouts, checks Running & Ready & stable, records Lessons.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiops-validate
+  namespace: aiops-system
+  labels:
+    app: aiops-validate
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # exactly one instance per role
+  selector:
+    matchLabels:
+      app: aiops-validate
+  template:
+    metadata:
+      labels:
+        app: aiops-validate
+        app.kubernetes.io/part-of: aiops-v2
+        aiops.homelab.dev/agent: validate
+    spec:
+      serviceAccountName: aiops-validate
+      priorityClassName: homelab-platform
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: aiops-v2:local
+          imagePullPolicy: Never
+          args: ["validate"]
+          env:
+            - name: AIOPS_SYSTEM_NAMESPACE
+              value: "aiops-system"
+            - name: AIOPS_ALL_NAMESPACES
+              value: "false"
+            - name: AIOPS_NAMESPACES
+              value: "aiops-demo,travel,github"
+            - name: AIOPS_POLL_INTERVAL
+              value: "15"
+            - name: AIOPS_VALIDATION_TIMEOUT
+              value: "120"
+            - name: AIOPS_STABILITY
+              value: "15"
+            - name: AIOPS_VALIDATION_POLL
+              value: "8"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            failureThreshold: 6
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests: {cpu: 10m, memory: 48Mi}
+            limits: {cpu: 300m, memory: 192Mi}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aiops-validate
+  namespace: aiops-system
+  labels:
+    app: aiops-validate
+    app.kubernetes.io/part-of: aiops-v2
+spec:
+  selector:
+    app: aiops-validate
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# The read-only console (served by the monitor).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: aiops-console
+  namespace: aiops-system
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: aiops.100-115-153-20.sslip.io
+      http: &paths
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: aiops-monitor
+                port: {name: http}
+    - host: aiops.localhost
+      http: *paths
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: aiops-v2
+  namespace: aiops-system
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: aiops-v2
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

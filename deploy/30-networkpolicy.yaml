@@ -1,0 +1,131 @@
+# Network isolation for aiops-system (k3s enforces NetworkPolicy out of the box).
+#
+#             | kube API | DNS | Ollama | internet :443 | pod network
+#   monitor   |    ✓     |  ✓  |        |               |
+#   diagnose  |    ✓     |  ✓  |   ✓    |      ✓        |      ✗   <- reads the web, can't touch pods
+#   repair    |    ✓     |  ✓  |        |      ✗        |      ✓   <- changes pods, can't reach the web
+#   validate  |    ✓     |  ✓  |        |               |
+#   aiops-eval|          |  ✓  |   ✓    |               |  ntfy only
+#
+# Adjust the node IP (192.168.0.16) and CIDRs for your cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: aiops-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Every agent: DNS + the Kubernetes API (Service VIP and the node's apiserver).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agents-dns-and-api
+  namespace: aiops-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: aiops-v2
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock: {cidr: 10.43.0.1/32}
+      ports:
+        - {protocol: TCP, port: 443}
+    - to:
+        - ipBlock: {cidr: 192.168.0.16/32}
+      ports:
+        - {protocol: TCP, port: 6443}
+---
+# Metrics for Prometheus, probes from the kubelet, the console via Traefik (host network).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agents-http-in
+  namespace: aiops-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: aiops-v2
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: monitoring}
+        - ipBlock: {cidr: 10.42.0.1/32}
+        - ipBlock: {cidr: 192.168.0.16/32}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: diagnose-llm-and-web
+  namespace: aiops-system
+spec:
+  podSelector:
+    matchLabels: {aiops.homelab.dev/agent: diagnose}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: {cidr: 192.168.0.16/32}
+      ports:
+        - {protocol: TCP, port: 11434}   # Ollama on the host
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10]
+      ports:
+        - {protocol: TCP, port: 443}     # web search (Exa)
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: repair-pod-precheck
+  namespace: aiops-system
+spec:
+  podSelector:
+    matchLabels: {aiops.homelab.dev/agent: repair}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock: {cidr: 10.42.0.0/16}  # pods, to pre-check a new probe path
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: eval-llm-and-ntfy
+  namespace: aiops-system
+spec:
+  podSelector:
+    matchLabels: {app: aiops-eval}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock: {cidr: 192.168.0.16/32}
+      ports:
+        - {protocol: TCP, port: 11434}
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: travel}
+          podSelector:
+            matchLabels: {app: ntfy}
+      ports:
+        - {protocol: TCP, port: 80}

@@ -1,0 +1,60 @@
+# Nightly evaluation of the decision path (diagnose -> repair checks) on frozen
+# scenarios, incl. a poisoned search result. No Kubernetes rights, no internet:
+# Ollama + ntfy only (see 30-networkpolicy.yaml). Summary -> ntfy topic "aiops".
+# Run now: kubectl -n aiops-system create job --from=cronjob/aiops-eval aiops-eval-manual
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aiops-eval
+  namespace: aiops-system
+spec:
+  schedule: "30 3 * * *"
+  timeZone: Asia/Taipei
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app: aiops-eval
+        spec:
+          restartPolicy: Never
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: eval
+              image: aiops-v2:local
+              imagePullPolicy: Never
+              command: ["python", "-m", "agents.simulate",
+                        "--variants", "default,evidence-first",
+                        "--notify", "http://ntfy.travel.svc.cluster.local/aiops"]
+              env:
+                - name: AIOPS_OLLAMA_ENDPOINT
+                  value: "http://ollama.aiops-demo.svc.cluster.local:11434"
+                - name: AIOPS_OLLAMA_MODEL
+                  value: "qwen3.5:4b"
+                - name: AIOPS_LLM_TIMEOUT
+                  value: "120"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests: {cpu: 20m, memory: 64Mi}
+                limits: {cpu: 300m, memory: 192Mi}
+          volumes:
+            - name: tmp
+              emptyDir: {}
