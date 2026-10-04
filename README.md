@@ -2,6 +2,8 @@
 
 # AIOps v2 — multi-agent self-healing for Kubernetes
 
+**English** | [繁體中文](README.zh-TW.md)
+
 **Four agents, four pods, four ServiceAccounts. They never call each other —
 they hand work over as Kubernetes resources.**
 
