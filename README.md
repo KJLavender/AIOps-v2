@@ -114,10 +114,18 @@ These permissions were checked on a running cluster with `kubectl auth can-i` an
 
 1. Guard: search results are scanned for prompt injection (instruction overrides, role hijacks, agent directives, `curl | sh`, `privileged`). Flagged results are dropped before the LLM sees them.
 2. Short list of actions: the LLM can only name `set_readiness_probe_path`, `rollout_restart`, `lower_requests` or `set_memory_limit`. Each is tied to a symptom and checked afterward. `set_image` and `set_env` exist only for fixed rules and only with values the operator approved.
-3. Evidence check and judge: the action must match something in the evidence. Then a second LLM call grades whether the answer is grounded in the evidence, fits the problem and is safe. It sees only the cluster evidence, and is told that startup noise is normal and the latest events count most.
+3. Evidence check and judge: the action must match something in the evidence, and nothing in the evidence may rule it out. For example, a restart is refused when the latest probe failure is "connection refused": nothing listens on that port, and a restart won't change that. This check is plain code and runs even when the judge is turned off. Then a second LLM call grades whether the answer is grounded in the evidence, fits the problem and is safe. It sees only the cluster evidence, and is told that startup noise is normal and the latest events count most.
 4. Live pre-check (repair): a new probe path must answer 2xx or 3xx on a running pod before the patch is applied.
 5. Validation and rollback: the pod must be Running, Ready and stable, or the change is undone with `rollout undo`. A fix that was rolled back is never proposed or applied again.
 6. Lessons: only fixes that passed validation are reused, and only for the same workload.
+
+### About the confidence and judge scores
+
+The LLM reports a confidence for its answer, and the judge gives three scores. Both are numbers the model says about itself. They have not been calibrated against real outcomes, so a 0.9 does not mean the answer is right nine times out of ten. In the nightly runs the model has picked the wrong fix for the wrong-port case with confidence 1.0, and the judge gave that answer 1.0 on every score.
+
+So the thresholds (`AIOPS_LLM_MIN_CONFIDENCE`, `AIOPS_LLM_AUTO_FIX_MIN_CONFIDENCE`, `AIOPS_JUDGE_MIN_SCORE`) only drop answers the model itself is unsure about. What stops a bad change are the checks that don't depend on the LLM: the action list and its parameter checks, the evidence check, the live pre-check, and validation with rollback.
+
+Calibrating the scores (for example with Platt scaling or isotonic regression) needs many past decisions with known outcomes. A home lab doesn't have enough of them yet.
 
 ## Metrics and dashboard
 
@@ -212,6 +220,7 @@ tests/       agent hand-over tests, and the shared-code tests from v1
 
 - Each agent runs as a single replica. There is no leader election. Restarts are safe because of the phases, but two replicas of the same role would race each other.
 - Agents poll with `kubectl` instead of using watches. This is simple and needs no libraries, and is fine for a home lab.
+- The confidence and judge scores are not calibrated. See [About the confidence and judge scores](#about-the-confidence-and-judge-scores).
 - Not built yet: a human approval step for LLM-proposed fixes, leader election, OpenTelemetry traces, and more allowed actions.
 
 ## License

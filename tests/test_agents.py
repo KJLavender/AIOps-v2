@@ -178,6 +178,21 @@ def test_llm_path_guard_and_judge(config):
     assert not rem["autoApply"] and trace["judge"]["passed"] is False
 
 
+class _RestartLLM(LLMAnalyzer):
+    def analyze(self, issue, data):
+        return Diagnosis(DiagnosisSource.LLM, issue.symptom, "not listening", "restart", confidence=1.0,
+                         proposed_action="rollout_restart")
+
+
+def test_evidence_check_runs_with_llm_judge_off(config):
+    config.llm_enabled = config.llm_auto_fix = True
+    config.judge_enabled = False
+    spec = incident_spec("NotReady", "not Ready", deployment(image="nginx", probe={"path": "/", "port": 8080}),
+                         events="Readiness probe failed: dial tcp 10.0.0.5:8080: connect: connection refused")
+    rem, trace = Decider(config, _RestartLLM(), web_search_stub(), Judge(config)).decide(spec, [], [])
+    assert not rem["autoApply"] and "rules out rollout_restart" in trace["judge"]["reason"]
+
+
 def test_diagnose_agent_creates_remediation_and_moves_incident(config, store):
     inc = store.create("Incident", incident_spec(), generate_name="inc-", status={"phase": crd.OPEN})
     DiagnoseAgent(config, store, decider(config)).handle(inc)

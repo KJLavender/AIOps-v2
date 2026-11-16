@@ -155,6 +155,12 @@ class Decider:
         except actions.UnsafeAction as exc:
             trace["rejected"] = str(exc)
             return diag
+        if not self.config.judge_enabled:  # the LLM judge is optional; the evidence check isn't
+            problem = self.judge.evidence_problem(issue, diag.proposed_action, ctx.events,
+                                                  ctx.previous_logs or ctx.logs)
+            if problem:
+                trace["judge"] = {"passed": False, "scores": {}, "reason": problem}
+                return diag
         if self.config.judge_enabled:
             container = container_from_deployment(dep, issue.container) or {}
             verdict = self.judge.review(issue, diag, plan.summary, events=ctx.events,

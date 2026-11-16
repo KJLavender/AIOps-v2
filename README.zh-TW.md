@@ -114,10 +114,18 @@ lesson.aiops.homelab.dev/lesson-44255cd418cf  case6-readiness  NotReady  set_rea
 
 1. 過濾器：搜尋結果會先掃描有沒有 prompt injection（覆寫指令、角色劫持、對 agent 下指令、`curl | sh`、`privileged`）。被標記的結果在 LLM 看到之前就丟掉。
 2. 短清單：LLM 只能點名 `set_readiness_probe_path`、`rollout_restart`、`lower_requests` 或 `set_memory_limit`。每個動作都對應一種症狀，之後還要驗證。`set_image` 和 `set_env` 只給固定規則用，而且只能用營運者核可的值。
-3. 證據比對與評審：動作必須和證據裡的某個訊號相符。接著再呼叫一次 LLM，評估答案是否有證據支持、是否切合問題、是否安全。評審只看叢集的證據，並被告知啟動時的雜訊是正常的，最新的 event 最重要。
+3. 證據比對與評審：動作必須和證據裡的某個訊號相符，而且證據裡不能有排除這個動作的訊號。例如最新一次探針失敗是「connection refused」時，不准重啟：那個 port 根本沒有程式在聽，重啟也不會變好。這一關是單純的程式判斷，就算關掉評審也會執行。接著再呼叫一次 LLM，評估答案是否有證據支持、是否切合問題、是否安全。評審只看叢集的證據，並被告知啟動時的雜訊是正常的，最新的 event 最重要。
 4. 即時預先檢查（repair）：新的探針路徑必須在執行中的 pod 上回 2xx 或 3xx，才會 patch。
 5. 驗證與回滾：pod 必須 Running、Ready 且穩定，否則用 `rollout undo` 撤銷。被回滾過的修復，不會再被提出或套用。
 6. Lesson：只有通過驗證的修復才會被重複使用，而且只用在同一個工作負載。
+
+### 關於信心分數和評審分數
+
+LLM 會替自己的答案報一個信心分數，評審也會打三項分數。這些都是模型自己說的數字，沒有拿實際結果校正過，所以 0.9 不代表十次有九次是對的。在每晚的評測裡，模型曾經在「探針連錯 port」的案例選了錯的修法，信心卻是 1.0，評審也給了三個 1.0。
+
+所以那幾個門檻（`AIOPS_LLM_MIN_CONFIDENCE`、`AIOPS_LLM_AUTO_FIX_MIN_CONFIDENCE`、`AIOPS_JUDGE_MIN_SCORE`）只能擋掉模型自己都沒把握的答案。真正擋住錯誤修改的，是不靠 LLM 判斷的關卡：動作清單和參數檢查、證據比對、即時預先檢查，以及驗證失敗就回滾。
+
+要校正分數（例如用 Platt scaling 或 isotonic regression），需要大量「已知結果」的過去決策。home lab 目前還沒有那麼多資料。
 
 ## 指標與儀表板
 
@@ -212,6 +220,7 @@ tests/       agent 交接測試，以及沿用自 v1 的共用程式測試
 
 - 每個 agent 只跑一個副本，沒有 leader election。靠 phase 讓重啟是安全的，但同一個角色跑兩個副本會互相搶。
 - agent 用 `kubectl` 輪詢，而不是用 watch。這樣簡單、不需要額外套件，對 home lab 規模夠用。
+- 信心分數和評審分數沒有校正過，見[關於信心分數和評審分數](#關於信心分數和評審分數)。
 - 還沒做的：對 LLM 提出的修復加上人工核可步驟、leader election、OpenTelemetry trace，以及更多允許的動作。
 
 ## 授權

@@ -3,7 +3,9 @@
 Two layers, after Future AGI's "heuristic + LLM-as-judge" evals:
 1. Evidence check (deterministic): the cluster data must contain the signal the
    action is meant for (a readiness probe failure for a probe-path change, an
-   OOM kill for a memory raise, ...). No signal -> rejected without an LLM call.
+   OOM kill for a memory raise, ...), and nothing in it may rule the action out
+   (a restart can't fix a probe port with nothing listening). Either way it is
+   rejected without an LLM call. This layer runs even with the LLM judge off.
 2. LLM judge: a second, independent call grades the proposal against the
    cluster evidence only - no web results, so a poisoned page can't vouch for
    itself. Every score must reach the threshold.
@@ -27,6 +29,14 @@ _EVIDENCE: dict[str, re.Pattern] = {
     "rollout_restart": re.compile(r"Readiness probe failed|Unhealthy|not Ready", re.IGNORECASE),
     "lower_requests": re.compile(r"Insufficient (cpu|memory)|FailedScheduling", re.IGNORECASE),
     "set_memory_limit": re.compile(r"OOMKilled|out of memory", re.IGNORECASE),
+}
+
+# Signals that rule an action out even when its trigger signal is present. Only
+# the latest probe failure counts, so "connection refused" while the container
+# was still starting doesn't veto anything.
+_CONTRADICTS: dict[str, re.Pattern] = {
+    # Nothing listens on the probed port: a spec problem a restart won't fix.
+    "rollout_restart": re.compile(r"connection refused", re.IGNORECASE),
 }
 
 _PROMPT = """You are a strict reviewer of automated Kubernetes fixes. Grade the
@@ -74,12 +84,22 @@ class Judge:
         pattern = _EVIDENCE.get(action)
         return bool(pattern and pattern.search(evidence or ""))
 
+    def evidence_problem(self, issue: PodIssue, action: str, events: str, logs: str) -> Optional[str]:
+        """The deterministic layer: why the evidence rejects the action, or None."""
+        if not self.evidence_supports(action, f"{issue.message}\n{events}\n{logs}"):
+            return f"no evidence in events/logs for {action}"
+        veto = _CONTRADICTS.get(action)
+        probe_failures = [line for line in (events or "").splitlines() if "probe failed" in line.lower()]
+        if veto and probe_failures and veto.search(probe_failures[-1]):
+            return f"evidence rules out {action}: latest probe failure is {veto.pattern}"
+        return None
+
     def review(self, issue: PodIssue, diagnosis: Diagnosis, change: str,
                events: str, logs: str, spec: str) -> Verdict:
         action = diagnosis.proposed_action or ""
-        evidence = f"{issue.message}\n{events}\n{logs}"
-        if not self.evidence_supports(action, evidence):
-            return Verdict(False, reason=f"no evidence in events/logs for {action}")
+        problem = self.evidence_problem(issue, action, events, logs)
+        if problem:
+            return Verdict(False, reason=problem)
         raw = self._ask(_PROMPT.format(
             symptom=issue.symptom.value, root_cause=diagnosis.root_cause, action=action,
             params=json.dumps(diagnosis.action_params, ensure_ascii=False), change=change,

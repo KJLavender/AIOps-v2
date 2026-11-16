@@ -114,6 +114,28 @@ def test_judge_needs_evidence_before_asking_llm():
     assert weak.passed is False and weak.scores["fits"] == 0.4
 
 
+def test_evidence_can_rule_an_action_out():
+    from aiops.judge import Judge
+    from aiops.models import Diagnosis, DiagnosisSource, PodIssue
+
+    judge = Judge(Config(ollama_endpoint="http://unused"))
+    judge._ask = lambda prompt: {"grounded": 1, "fits": 1, "safe": 1}  # an over-confident judge
+    issue = PodIssue("ns", "p", "app", Symptom.NOT_READY, "not Ready")
+    restart = Diagnosis(DiagnosisSource.LLM, Symptom.NOT_READY, "not listening", "restart",
+                        confidence=1.0, proposed_action="rollout_restart")
+    refused = 'Readiness probe failed: Get "http://10.42.0.9:8080/": dial tcp 10.42.0.9:8080: connect: connection refused'
+    vetoed = judge.review(issue, restart, "change", events=refused, logs="", spec="{}")
+    assert vetoed.passed is False and "rules out rollout_restart" in vetoed.reason
+    # A refusal while the container was starting doesn't count; only the latest failure does.
+    later = judge.review(issue, restart, "change", events=refused + "\nReadiness probe failed: context deadline exceeded",
+                         logs="", spec="{}")
+    assert later.passed is True
+    path = Diagnosis(DiagnosisSource.LLM, Symptom.NOT_READY, "404", "use /",
+                     proposed_action="set_readiness_probe_path", action_params={"path": "/"})
+    assert judge.evidence_problem(issue, "set_readiness_probe_path", refused, "") is None
+    assert judge.review(issue, path, "change", events=refused, logs="", spec="{}").passed is True
+
+
 def test_generalize_drops_pod_reference_and_uid():
     text = ("kubernetes CrashLoopBackOff Back-off restarting failed container app in pod "
             "case1-crashloop-778dc97f77-w4kmf_aiops-demo(6d1dc46d-783c-499b-a47c-82d49ab111da)")
