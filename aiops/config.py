@@ -100,6 +100,13 @@ class Config:
     diagnose_workers: int = 2
     validate_workers: int = 4
     agent_port: int = 8080  # /metrics, /healthz (and the console on the monitor)
+    # Tiered automation: fixes from these sources wait for a human "approve"
+    # (an ntfy button) before repair applies them. Rules and Lessons stay automatic.
+    approval_sources: list[str] = field(default_factory=lambda: ["llm"])
+    approval_ttl_seconds: int = 3600  # unanswered approvals are rejected after this
+    approval_ntfy_url: str = ""  # e.g. http://ntfy.travel.svc.cluster.local/aiops-approvals
+    console_url: str = ""  # how the phone reaches the monitor console (approve buttons)
+    outcome_retention_days: int = 365  # decision outcomes outlive their Incidents
 
     # --- Dashboard ---
     dashboard_host: str = "127.0.0.1"  # use 0.0.0.0 in-cluster
@@ -157,6 +164,11 @@ class Config:
             diagnose_workers=_env_int("AIOPS_DIAGNOSE_WORKERS", 2),
             validate_workers=_env_int("AIOPS_VALIDATE_WORKERS", 4),
             agent_port=_env_int("AIOPS_PORT", 8080),
+            approval_sources=[x.strip() for x in os.getenv("AIOPS_APPROVAL_SOURCES", "llm").split(",") if x.strip()],
+            approval_ttl_seconds=_env_int("AIOPS_APPROVAL_TTL", 3600),
+            approval_ntfy_url=os.getenv("AIOPS_APPROVAL_NTFY", ""),
+            console_url=os.getenv("AIOPS_CONSOLE_URL", "").rstrip("/"),
+            outcome_retention_days=_env_int("AIOPS_OUTCOME_RETENTION_DAYS", 365),
             dashboard_host=os.getenv("AIOPS_DASHBOARD_HOST", "127.0.0.1"),
             dashboard_port=_env_int("AIOPS_DASHBOARD_PORT", 8080),
         )

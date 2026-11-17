@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import urllib.parse
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
@@ -46,8 +47,12 @@ METRICS = Registry()
 
 
 def serve(port: int, agent: str, routes: Optional[dict[str, Callable[[], tuple[str, bytes]]]] = None,
-          healthy: Callable[[], bool] = lambda: True) -> ThreadingHTTPServer:
-    """/metrics and /healthz, plus optional extra GET routes -> (content type, body)."""
+          healthy: Callable[[], bool] = lambda: True,
+          post: Optional[Callable[[str, dict], tuple[int, str, bytes]]] = None) -> ThreadingHTTPServer:
+    """/metrics and /healthz, plus optional extra GET routes -> (content type, body).
+
+    post(path, query) answers POST requests -> (status, content type, body).
+    """
     routes = routes or {}
 
     class Handler(BaseHTTPRequestHandler):
@@ -75,6 +80,14 @@ def serve(port: int, agent: str, routes: Optional[dict[str, Callable[[], tuple[s
                 self._send(200, ctype, body)
             else:
                 self._send(404, "text/plain", b"not found")
+
+        def do_POST(self):
+            if post is None:
+                self._send(405, "text/plain", b"method not allowed")
+                return
+            path, _, query = self.path.partition("?")
+            code, ctype, body = post(path, {k: v[0] for k, v in urllib.parse.parse_qs(query).items()})
+            self._send(code, ctype, body)
 
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=server.serve_forever, name="http", daemon=True).start()

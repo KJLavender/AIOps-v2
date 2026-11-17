@@ -90,3 +90,9 @@ def test_scorer_catches_wrong_answers(config):
     wrong_port = scored["probe-on-wrong-port"]  # not fixing is right here; the cause is still wrong
     assert wrong_port["passed"] and wrong_port["tasks"]["localization"] is False
     assert scored["healthy"]["passed"]  # never detected, so never touched
+
+
+def test_oracle_confidence_is_perfectly_calibrated(config):
+    results = [simulate.run_scenario(sc, config, simulate.ORACLE) for sc in _scenarios()]
+    cal = simulate.summarize(results)["variants"]["oracle"]["calibration"]
+    assert cal == {"n": 5, "brier": 0.0}  # five textbook answers propose a fix, all acceptable

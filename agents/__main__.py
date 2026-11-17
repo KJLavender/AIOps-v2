@@ -26,13 +26,13 @@ def main(argv: list[str]) -> int:
     kube = KubeClient(config)
     store = crd.Store(kube, config.system_namespace)
     loop = Loop(name, interval=config.poll_interval_seconds)
-    routes = {}
+    routes, post = {}, None
 
     if name == "monitor":
-        from .console import console_routes
+        from .console import approval_post, console_routes
         from .monitor import Monitor
         agent = Monitor(config, kube, store)
-        routes = console_routes(store)
+        routes, post = console_routes(store), approval_post(store)
     elif name == "diagnose":
         from .diagnose import Decider, DiagnoseAgent
         llm = OllamaAnalyzer(config) if config.llm_enabled else NullAnalyzer()
@@ -44,7 +44,7 @@ def main(argv: list[str]) -> int:
         from .validate import ValidateAgent
         agent = ValidateAgent(config, kube, store)
 
-    serve(config.agent_port, name, routes, healthy=loop.healthy)
+    serve(config.agent_port, name, routes, healthy=loop.healthy, post=post)
     logging.getLogger("agents").info("%s agent started (system namespace %s)", name, config.system_namespace)
     loop.run_forever(agent.step)
     return 0

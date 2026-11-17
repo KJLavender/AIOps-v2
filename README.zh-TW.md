@@ -18,6 +18,8 @@ v2 讓每個 agent 各跑在自己的 pod 裡，用自己的 Kubernetes ServiceA
 - 能改動叢集的 agent，沒有連上網際網路的路線。它也不會套用別人寫好的修改，而是自己重新組出修改內容。
 - log 在交給其他 agent 之前，會先把密碼等機密遮掉，所以不會被帶進網路搜尋。
 - 每個步驟都是一個帶有歷史紀錄的 Kubernetes 物件，用 `kubectl get incidents,remediations,lessons` 就能查。
+- LLM 想出來的修法，要等人在手機通知上按「Approve」才會執行。固定規則和在同一個工作負載上驗證過的修法，照樣自動執行。
+- 每個結案的修復都會另外存成一筆 Outcome，記下當時的分數和實際結果，之後就能拿 LLM 的信心分數跟現實對照。
 - 診斷和驗證各有 worker pool 同時處理，一個慢的修復不會擋住其他的。
 - 沒辦法修好的問題，只有在工作負載變動（Deployment 的 generation 變了）或隔 6 小時後，才會重新檢查。
 
@@ -36,6 +38,7 @@ sequenceDiagram
     M->>M: Incident {evidence: redacted logs, events, container spec}
     D->>D: rules → Lessons → web search + guard → LLM → judge
     D->>D: Remediation {action, params, autoApply}
+    Note over D,R: an LLM fix waits in AwaitingApproval until a person taps Approve (ntfy)
     R->>K: get live Deployment
     R->>R: rebuild patch from catalog, re-check allowlists, pre-check pod
     R->>K: kubectl patch
@@ -61,7 +64,7 @@ sequenceDiagram
 
 | Agent | 做什麼 | Kubernetes 權限（在被監看的 namespace） | 網路 |
 | --- | --- | --- | --- |
-| monitor | 找出出問題的 pod，存下清理過的證據，開 Incident，刪除舊的，並提供唯讀的網頁 console | 讀 pod、log、event、Deployment、ReplicaSet | 只連 Kubernetes API |
+| monitor | 找出出問題的 pod，存下清理過的證據，開 Incident，刪除舊的，記錄 Outcome，提供網頁 console 並接收同意 / 拒絕 | 讀 pod、log、event、Deployment、ReplicaSet | 只連 Kubernetes API |
 | diagnose | 依序試規則、過去的 Lesson、受保護的網路搜尋、LLM，最後交給評審。寫出 Remediation 提案 | 無 | API、Ollama、對外 443 port |
 | repair | 針對現況的 Deployment，依允許動作清單重新組出修改，檢查後再 patch。修復失敗時回滾 | 讀取並 patch Deployment，讀 ReplicaSet 和 pod | API 和 pod 網路（做預先檢查）。不能上網 |
 | validate | 等 rollout 完成，確認 pod 是 Running、Ready 且穩定，記錄 Lesson | 讀 Deployment、ReplicaSet、pod | 只連 API |
@@ -75,8 +78,9 @@ sequenceDiagram
 | 種類 | 由誰建立 | 階段（phase） |
 | --- | --- | --- |
 | `Incident` | monitor | `Open`、`Diagnosing`、`Proposed`、`Remediating`，最後是 `Resolved` 或 `Unresolved` |
-| `Remediation` | diagnose（歸屬於對應的 Incident） | `Proposed` 或 `Recommended`，接著 `Applying`、`Applied`，再來是 `Validated` 或 `Failed`，然後 `RolledBack`；或是 `Rejected` |
+| `Remediation` | diagnose（歸屬於對應的 Incident） | `AwaitingApproval`（LLM 的修法）、`Proposed` 或 `Recommended`，接著 `Applying`、`Applied`，再來是 `Validated` 或 `Failed`，然後 `RolledBack`；或是 `Rejected` |
 | `Lesson` | validate（每個工作負載加症狀一筆） | 無 |
+| `Outcome` | monitor（每個結案的 Remediation 一筆，保留 365 天） | 無 |
 
 ```console
 $ kubectl get incidents,remediations,lessons -n aiops-system
@@ -106,6 +110,7 @@ lesson.aiops.homelab.dev/lesson-44255cd418cf  case6-readiness  NotReady  set_rea
 | validate | 不行 | 不行 | 不行 | 不行 | 不行 |
 
 - RBAC（Kubernetes 的權限）：每個 agent 一個 ServiceAccount，只用限定 namespace 的 Role。權限表寫在 [`deploy/generate_rbac.py`](deploy/generate_rbac.py)，並由它產生 `deploy/10-rbac.yaml`。沒有任何 agent 能讀 Secret、刪除工作負載，或碰 `kube-system` 和 `monitoring`。
+- monitor 只能改一件事：等待核可中的 Remediation 的狀態（同意、拒絕或過期）。它碰不到任何工作負載，而且核可之後 repair 還是會重新檢查一遍。
 - NetworkPolicy（pod 的防火牆規則）：`aiops-system` 內預設全部擋掉，再替每個 agent 開放它需要的連線（[`deploy/30-networkpolicy.yaml`](deploy/30-networkpolicy.yaml)）。
 - 證據清理：log 和 event 裡的密碼、token、bearer 與 basic 認證標頭、AWS 金鑰、GitHub token、JWT 和 `user:pass@` 形式的網址都會被移除。環境變數只複製名稱，從不複製值。
 - 不傳遞 patch。Remediation 裡只有 `action` 和 `params`，沒有 patch。repair 會依現況的 Deployment 和允許動作清單自己組出 patch，所以被竄改的提案（例如 `set_image: evil/miner`）會被拒絕。
@@ -118,6 +123,33 @@ lesson.aiops.homelab.dev/lesson-44255cd418cf  case6-readiness  NotReady  set_rea
 4. 即時預先檢查（repair）：新的探針路徑必須在執行中的 pod 上回 2xx 或 3xx，才會 patch。
 5. 驗證與回滾：pod 必須 Running、Ready 且穩定，否則用 `rollout undo` 撤銷。被回滾過的修復，不會再被提出或套用。
 6. Lesson：只有通過驗證的修復才會被重複使用，而且只用在同一個工作負載。
+7. 人工核可：LLM 提出的修法，要有人同意才會套用，見下面。
+
+### 人工核可
+
+修法有三個來源，各自給不同程度的信任：
+
+| 來源 | 怎麼處理 |
+| --- | --- |
+| 固定規則 | 自動套用 |
+| Lesson（同一個修法已經在這個工作負載上成功過） | 自動套用 |
+| LLM | 通過上面所有關卡後，停在 `AwaitingApproval` 等人決定 |
+
+等待期間，diagnose 會推播到 ntfy 的 `aiops-approvals` topic，內容有目標、要改什麼、信心分數、評審分數，以及兩個按鈕。按鈕會帶著一次性的 token 對 monitor console 送出 POST。Remediation 上只存 token 的 SHA-256，所以光是讀得到叢集物件，也沒辦法替人按同意。token 錯了回 403，重複回答回 409，一小時沒人回應就自動拒絕（`AIOPS_APPROVAL_TTL`）。
+
+按同意只是把 Remediation 改成 `Proposed`。repair 照樣會依現況的 Deployment 重新組 patch、做預先檢查，所以人說好也不會跳過任何一關。沒有手機時，可以在終端機回答：`python -m agents.approval <remediation> approve`（或 `reject`）。
+
+同一個修法在某個工作負載上被同意、而且驗證成功之後，會變成 Lesson，下次就直接自動套用。信任是一個工作負載一個工作負載累積的。
+
+叢集上的一次實際紀錄：
+
+```
+18:16:49  AwaitingApproval  Change app readiness probe path /healthz -> / (LLM + web)   <- diagnose
+18:18:45  Proposed          approved by a human (ntfy)                                  <- monitor
+18:18:50  Applying          re-checking the proposal against the live cluster           <- repair
+18:18:52  Applied           Change app readiness probe path /healthz -> /               <- repair
+18:19:24  Validated         Running & Ready & stable                                     <- validate
+```
 
 ### 關於信心分數和評審分數
 
@@ -125,7 +157,11 @@ LLM 會替自己的答案報一個信心分數，評審也會打三項分數。�
 
 所以那幾個門檻（`AIOPS_LLM_MIN_CONFIDENCE`、`AIOPS_LLM_AUTO_FIX_MIN_CONFIDENCE`、`AIOPS_JUDGE_MIN_SCORE`）只能擋掉模型自己都沒把握的答案。真正擋住錯誤修改的，是不靠 LLM 判斷的關卡：動作清單和參數檢查、證據比對、即時預先檢查，以及驗證失敗就回滾。
 
-要校正分數（例如用 Platt scaling 或 isotonic regression），需要大量「已知結果」的過去決策。home lab 目前還沒有那麼多資料。
+要校正分數（例如用 Platt scaling 或 isotonic regression），需要大量「已知結果」的過去決策。home lab 目前還沒有那麼多資料，所以 agent 現在會開始收集：
+
+- 每個結案的 Remediation 都會存成一筆 `Outcome`：來源、動作、信心分數、評審分數、有沒有問過人，以及結果（`validated`、`rolled_back`、`rejected` 或 `recommended`）。Outcome 保留 365 天，Incident 刪掉後也還在。
+- `python -m agents.outcomes` 會列出各來源的修法成功了幾次、各信心區間裡被套用的 LLM 修法成功率，以及 LLM 信心分數的 Brier 分數（0 是完美，越低越好）。console 上也看得到同樣的摘要。
+- 每晚的模擬也會替每個 prompt 版本算 Brier 分數：只要 LLM 提出了修法，就拿它的信心分數跟「這個修法該不該做」對照。
 
 ## 指標與儀表板
 
@@ -192,12 +228,16 @@ kubectl describe remediation -n aiops-system <name>     # 完整歷史與評估
 | `AIOPS_AUTO_FIX` / `AIOPS_DRY_RUN` | `true` / `false` | repair | 實際套用修復，或只記錄 |
 | `AIOPS_ACTION_PRECHECK` / `AIOPS_MAX_MEMORY` | `true` / `2Gi` | repair | 預先檢查；記憶體上限 |
 | `AIOPS_VALIDATION_TIMEOUT` / `AIOPS_STABILITY` | `300` / `60` | validate | 等 rollout 的秒數；需要穩定多久（秒） |
+| `AIOPS_APPROVAL_SOURCES` | `llm` | diagnose | 哪些來源的修法需要人同意（逗號分隔，空白代表都不用） |
+| `AIOPS_APPROVAL_TTL` | `3600` | diagnose | 幾秒沒人回應就自動拒絕 |
+| `AIOPS_APPROVAL_NTFY` / `AIOPS_CONSOLE_URL` | 無 | diagnose | 推播核可請求的 ntfy topic 網址；手機按鈕要連的 console 位址 |
+| `AIOPS_OUTCOME_RETENTION_DAYS` | `365` | monitor | Outcome 保留幾天 |
 
 ## 測試
 
 ```bash
 pip install pytest
-pytest -q                                   # 76 個測試，不需要叢集或網路，約 0.1 秒
+pytest -q                                   # 86 個測試，不需要叢集或網路，約 1 秒
 python -m agents.simulate --variants oracle                   # 用寫好的標準答案，不需要 Ollama
 python -m agents.simulate --variants default,evidence-first   # 需要 Ollama
 ```
@@ -220,9 +260,10 @@ python -m agents.simulate --variants default,evidence-first   # 需要 Ollama
 
 ```
 agents/      monitor.py  diagnose.py  repair.py  validate.py  console.py  simulate.py
+             approval.py（人工核可）  outcomes.py（分數與實際結果）
 aiops/       共用程式：rules/、llm/、actions.py（允許的動作）、guard.py、judge.py、
              websearch.py、evidence.py（擷取與清理）、crd.py（物件儲存）、metrics.py
-crds/        Incident、Remediation、Lesson
+crds/        Incident、Remediation、Lesson、Outcome
 deploy/      namespace、RBAC（自動產生）、agents、NetworkPolicy、eval CronJob、儀表板
 tests/       agent 交接測試，以及沿用自 v1 的共用程式測試
 ```
@@ -231,8 +272,9 @@ tests/       agent 交接測試，以及沿用自 v1 的共用程式測試
 
 - 每個 agent 只跑一個副本，沒有 leader election。靠 phase 讓重啟是安全的，但同一個角色跑兩個副本會互相搶。
 - agent 用 `kubectl` 輪詢，而不是用 watch。這樣簡單、不需要額外套件，對 home lab 規模夠用。
-- 信心分數和評審分數沒有校正過，見[關於信心分數和評審分數](#關於信心分數和評審分數)。
-- 還沒做的：對 LLM 提出的修復加上人工核可步驟、leader election、OpenTelemetry trace，以及更多允許的動作。
+- 信心分數和評審分數還沒有校正，正在收集 Outcome 資料，見[關於信心分數和評審分數](#關於信心分數和評審分數)。
+- 核可按鈕只有在 Tailscale 網路裡的裝置才按得到。console 沒有登入機制，不要公開到網路上。
+- 還沒做的：leader election、OpenTelemetry trace，以及更多允許的動作。
 
 ## 授權
 

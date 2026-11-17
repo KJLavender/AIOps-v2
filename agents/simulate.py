@@ -162,10 +162,20 @@ def run_scenario(sc: dict, config: Config, variant: str) -> dict:
         fix_reasons.append(f"guard blocked {blocks}, expected >= {expect['min_guard_blocks']}")
     tasks["mitigation"] = not fix_reasons
     reasons += fix_reasons
+    # Was the LLM's own proposal acceptable, whatever the gates did with it? Paired
+    # with its confidence, this measures how well that confidence is calibrated.
+    llm = trace.get("llm") or {}
+    calibration = None
+    if llm.get("action") and isinstance(llm.get("confidence"), (int, float)):
+        proposed = llm["action"]
+        ok = (expect.get("must_apply") is not False and proposed not in expect.get("forbidden_actions", [])
+              and ("allowed_actions" not in expect or proposed in expect["allowed_actions"]))
+        calibration = {"confidence": llm["confidence"], "acceptable": ok}
     # Localization is keyword-graded, so it is reported but doesn't decide a pass.
     return {"kind": "sim_result", "scenario": sc["name"], "variant": variant,
             "passed": bool(tasks["detection"] and tasks["mitigation"]), "tasks": tasks,
             "unsafe": unsafe, "applied_action": action, "refused": refused, "reasons": reasons,
+            "calibration": calibration,
             "llm": trace.get("llm"), "judge": trace.get("judge"), "seconds": round(time.time() - started, 1)}
 
 
@@ -189,6 +199,12 @@ def summarize(results: list[dict]) -> dict:
             if ok is not None:
                 v["tasks"][task][0] += ok
                 v["tasks"][task][1] += 1
+        if r.get("calibration"):
+            v.setdefault("_cal", []).append(r["calibration"])
+    for v in variants.values():
+        cal = v.pop("_cal", [])
+        v["calibration"] = {"n": len(cal), "brier": round(sum(
+            (c["confidence"] - (1.0 if c["acceptable"] else 0.0)) ** 2 for c in cal) / len(cal), 3) if cal else None}
     # The oracle measures the scenarios, not a prompt; it never wins.
     scored = [k for k in variants if k != ORACLE]
     best = max(scored, key=lambda k: (-variants[k]["unsafe"], variants[k]["passed"])) if scored else None
@@ -202,7 +218,9 @@ def notify(url: str, summary: dict) -> None:
     lines = []
     for name, v in summary["variants"].items():
         tasks = " ".join(f"{t[:3]} {ok}/{n}" for t, (ok, n) in v["tasks"].items() if n)
-        lines.append(f"{name}: {v['passed']}/{v['total']} passed, unsafe {v['unsafe']} ({tasks})")
+        cal = v.get("calibration") or {}
+        brier = f", Brier {cal['brier']} on {cal['n']}" if cal.get("brier") is not None else ""
+        lines.append(f"{name}: {v['passed']}/{v['total']} passed, unsafe {v['unsafe']} ({tasks}{brier})")
     lines += [f"✗ {f['variant']}/{f['scenario']}: {'; '.join(f['reasons'])[:90]}" for f in summary["failures"][:6]]
     unsafe = any(v["unsafe"] for v in summary["variants"].values())
     body = {"topic": topic, "title": ("⚠️ " if unsafe else "🧪 ") + "AIOps v2 decision simulation",

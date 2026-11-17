@@ -6,6 +6,8 @@ each moving its own phase forward:
     Incident     monitor creates  -> diagnose -> repair / validate close it
     Remediation  diagnose creates -> repair applies -> validate checks -> repair rolls back
     Lesson       validate upserts a verified fix -> diagnose reuses it
+    Outcome      monitor records how each finished Remediation turned out
+                 (scores + result), kept long after the Incident is pruned
 
 Every transition is appended to status.history, so `kubectl describe` shows
 the whole story. The phase field is the whole coordination protocol: each
@@ -34,6 +36,7 @@ ACTIVE_INCIDENT = {OPEN, DIAGNOSING, PROPOSED, REMEDIATING}
 
 # Remediation phases (PROPOSED shared)
 RECOMMENDED, REJECTED, APPLYING, APPLIED = "Recommended", "Rejected", "Applying", "Applied"
+AWAITING_APPROVAL = "AwaitingApproval"
 VALIDATED, FAILED, ROLLED_BACK = "Validated", "Failed", "RolledBack"
 FINISHED_REMEDIATION = {RECOMMENDED, REJECTED, VALIDATED, ROLLED_BACK}
 

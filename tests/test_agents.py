@@ -304,3 +304,165 @@ def test_unchanged_unresolved_issue_is_rechecked_rarely(config, store):
         assert mon._should_open(inc, "fp-gen3")      # periodic recheck
     finally:
         _crd.age_seconds = real_age
+
+
+# --- approval (tiered automation) -----------------------------------------------
+from agents import approval, outcomes  # noqa: E402
+from agents.console import approval_post  # noqa: E402
+
+
+def _llm_decider(config):
+    config.llm_enabled = config.llm_auto_fix = True
+    judge = Judge(config)
+    judge._ask = lambda prompt: {"grounded": 1.0, "fits": 1.0, "safe": 1.0}
+    return Decider(config, _ProbeLLM(), web_search_stub(), judge)
+
+
+def _awaiting(config, store, monkeypatch):
+    sent = []
+    monkeypatch.setattr(approval, "notify", lambda cfg, rem, token: sent.append(token) or True)
+    inc = store.create("Incident", _probe_incident(), generate_name="inc-", status={"phase": crd.OPEN})
+    rem = DiagnoseAgent(config, store, _llm_decider(config)).handle(inc)
+    return inc["metadata"]["name"], rem, sent[0]
+
+
+def test_llm_fix_waits_for_approval_but_rule_fix_does_not(config, store, monkeypatch):
+    name, rem, token = _awaiting(config, store, monkeypatch)
+    rem = store.get("remediations", name)
+    assert crd.phase(rem) == crd.AWAITING_APPROVAL and rem["spec"]["autoApply"]
+    assert token not in json.dumps(rem) and rem["spec"]["approval"]["tokenHash"]
+    assert store.get("incidents", name)["status"]["message"].startswith("waiting for approval")
+    inc = store.create("Incident", incident_spec(), generate_name="inc-", status={"phase": crd.OPEN})
+    DiagnoseAgent(config, store, decider(config)).handle(inc)  # a rule: no approval needed
+    assert crd.phase(store.get("remediations", inc["metadata"]["name"])) == crd.PROPOSED
+
+
+def test_approval_needs_the_token_then_repair_still_checks(config, store, monkeypatch):
+    name, _, token = _awaiting(config, store, monkeypatch)
+    assert approval.decide(store, name, True, token="guess")[0] == 403
+    assert crd.phase(store.get("remediations", name)) == crd.AWAITING_APPROVAL
+    kube = FakeKube(deployment(image="nginx", probe={"path": "/healthz", "port": 80}))
+    repairer = Repairer(config, kube, store)
+    repairer.step()
+    assert kube.patches == []  # nothing happens while waiting
+    assert approval.decide(store, name, True, token=token)[0] == 200
+    rem = store.get("remediations", name)
+    assert crd.phase(rem) == crd.PROPOSED and rem["status"]["approvedBy"] == "ntfy"
+    repairer.http_status = lambda url: 404  # the pre-check still runs after a human "yes"
+    repairer.step()
+    assert kube.patches == [] and crd.phase(store.get("remediations", name)) == crd.REJECTED
+    assert approval.decide(store, name, True, token=token)[0] == 409  # one answer only
+
+
+def test_approved_fix_is_applied(config, store, monkeypatch):
+    name, _, token = _awaiting(config, store, monkeypatch)
+    approval.decide(store, name, True, token=token)
+    kube = FakeKube(deployment(image="nginx", probe={"path": "/healthz", "port": 80}))
+    repairer = Repairer(config, kube, store)
+    repairer.http_status = lambda url: 200
+    repairer.step()
+    assert kube.patches and crd.phase(store.get("remediations", name)) == crd.APPLIED
+
+
+def test_reject_and_expiry(config, store, monkeypatch):
+    name, _, token = _awaiting(config, store, monkeypatch)
+    assert approval.decide(store, name, False, token=token)[0] == 200
+    assert crd.phase(store.get("remediations", name)) == crd.REJECTED
+    assert crd.phase(store.get("incidents", name)) == crd.UNRESOLVED
+    name, _, token = _awaiting(config, store, monkeypatch)
+    store.objs["remediations"][name]["spec"]["approval"]["expiresAt"] = "2020-01-01T00:00:00Z"
+    assert approval.decide(store, name, True, token=token)[0] == 410
+    name, _, _ = _awaiting(config, store, monkeypatch)
+    store.objs["remediations"][name]["spec"]["approval"]["expiresAt"] = "2020-01-01T00:00:00Z"
+    approval.expire_stale(store, store.list("remediations"))
+    rem = store.get("remediations", name)
+    assert crd.phase(rem) == crd.REJECTED and rem["status"]["message"] == "approval expired"
+
+
+def test_console_approval_route(config, store, monkeypatch):
+    name, _, token = _awaiting(config, store, monkeypatch)
+    handle = approval_post(store)
+    assert handle(f"/api/approval/{name}", {"decision": "approve"})[0] == 404  # no token
+    assert handle("/api/state", {"decision": "approve", "token": token})[0] == 404
+    code, _, body = handle(f"/api/approval/{name}", {"decision": "approve", "token": token})
+    assert code == 200 and body.startswith(b"approved")
+
+
+class _Resp:
+    def read(self):
+        return b""
+
+
+def test_notification_carries_buttons_with_the_token(config, monkeypatch):
+    import urllib.request
+    config.approval_ntfy_url = "http://ntfy.example/aiops-approvals"
+    config.console_url = "http://aiops.example:8000"
+    sent = {}
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=10: sent.update(json.loads(req.data)) or _Resp())
+    _, record = approval.new_request(config)
+    rem = {"metadata": {"name": "inc-1"}, "spec": {"target": {"namespace": "demo", "deployment": "web"},
+           "symptom": "NotReady", "summary": "probe /healthz -> /", "confidence": 0.9, "approval": record}}
+    assert approval.notify(config, rem, "tok123")
+    assert sent["topic"] == "aiops-approvals"
+    assert [a["label"] for a in sent["actions"]] == ["Approve", "Reject"]
+    assert sent["actions"][0]["url"] == "http://aiops.example:8000/api/approval/inc-1?token=tok123&decision=approve"
+    assert sent["actions"][0]["method"] == "POST"
+
+
+def test_http_server_routes_post():
+    import socket
+    import urllib.request
+    from aiops.metrics import serve
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    seen = []
+    server = serve(port, "test", post=lambda path, q: seen.append((path, q)) or (200, "text/plain", b"ok"))
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/approval/x?token=t&decision=approve", method="POST")
+        assert urllib.request.urlopen(req, timeout=5).read() == b"ok"
+        assert seen == [("/api/approval/x", {"token": "t", "decision": "approve"})]
+    finally:
+        server.shutdown()
+
+
+# --- outcomes ----------------------------------------------------------------------
+def _finished(store, name, phases, confidence=0.9, source="llm"):
+    spec = {"symptom": "NotReady", "target": {"namespace": "demo", "deployment": name, "container": "app"},
+            "source": source, "action": "set_readiness_probe_path", "params": {"path": "/"},
+            "confidence": confidence, "autoApply": True,
+            "evaluation": {"judge": {"passed": True, "scores": {"grounded": 1.0}}, "guardFlags": ["x"]}}
+    rem = store.create("Remediation", spec, name=name, status={"phase": phases[0]})
+    for p in phases[1:]:
+        extra = {"approvedBy": "ntfy"} if p == crd.PROPOSED and crd.AWAITING_APPROVAL in phases else {}
+        rem = store.set_status(rem, p, "done", **extra)
+    return rem
+
+
+def test_outcomes_recorded_once_with_scores_and_result(store):
+    _finished(store, "ok", [crd.AWAITING_APPROVAL, crd.PROPOSED, crd.APPLYING, crd.APPLIED, crd.VALIDATED], 0.9)
+    _finished(store, "bad", [crd.PROPOSED, crd.APPLYING, crd.APPLIED, crd.FAILED, crd.ROLLED_BACK], 0.95)
+    _finished(store, "no", [crd.AWAITING_APPROVAL, crd.REJECTED], 0.8)
+    _finished(store, "busy", [crd.PROPOSED, crd.APPLYING], 0.7)
+    known = set()
+    assert outcomes.record(store, store.list("remediations"), known) == 3
+    assert outcomes.record(store, store.list("remediations"), known) == 0
+    recs = {o["metadata"]["name"]: o["spec"] for o in store.list("outcomes")}
+    assert recs["ok"]["worked"] is True and recs["ok"]["approval"] == "approved"
+    assert recs["bad"]["applied"] and recs["bad"]["worked"] is False
+    assert recs["no"]["applied"] is False and recs["no"]["approval"] == "asked"
+    assert recs["ok"]["judgeScores"] == {"grounded": 1.0} and recs["ok"]["guardFlags"] == 1
+    s = outcomes.summarize(list(recs.values()))
+    assert s["llmApplied"] == 2 and s["llmBrier"] == round(((0.9 - 1) ** 2 + 0.95 ** 2) / 2, 3)
+    assert s["bySource"]["llm"] == {"total": 3, "applied": 2, "worked": 1}
+
+
+def test_monitor_bookkeeping_expires_records_and_prunes(config, store, monkeypatch):
+    name, _, _ = _awaiting(config, store, monkeypatch)
+    store.objs["remediations"][name]["spec"]["approval"]["expiresAt"] = "2020-01-01T00:00:00Z"
+    store.create("Outcome", {"result": "validated"}, name="old")
+    store.objs["outcomes"]["old"]["metadata"]["creationTimestamp"] = "2020-01-01T00:00:00Z"
+    Monitor(config, kube=None, store=store).bookkeeping()
+    assert crd.phase(store.get("remediations", name)) == crd.REJECTED
+    assert store.get("outcomes", name)["spec"]["result"] == "rejected"
+    assert store.get("outcomes", "old") is None

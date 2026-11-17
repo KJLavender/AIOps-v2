@@ -15,7 +15,7 @@ class FakeStore:
     """In-memory stand-in for crd.Store (same method surface)."""
 
     def __init__(self):
-        self.objs = {"incidents": {}, "remediations": {}, "lessons": {}}
+        self.objs = {"incidents": {}, "remediations": {}, "lessons": {}, "outcomes": {}}
         self._seq = itertools.count(1)
 
     def list(self, plural, selector=None):

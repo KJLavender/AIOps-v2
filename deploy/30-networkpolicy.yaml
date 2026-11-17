@@ -2,7 +2,7 @@
 #
 #             | kube API | DNS | Ollama | internet :443 | pod network
 #   monitor   |    ✓     |  ✓  |        |               |
-#   diagnose  |    ✓     |  ✓  |   ✓    |      ✓        |      ✗   <- reads the web, can't touch pods
+#   diagnose  |    ✓     |  ✓  |   ✓    |      ✓        |      ✗   <- reads the web, can't touch pods (+ ntfy for approvals)
 #   repair    |    ✓     |  ✓  |        |      ✗        |      ✓   <- changes pods, can't reach the web
 #   validate  |    ✓     |  ✓  |        |               |
 #   aiops-eval|          |  ✓  |   ✓    |               |  ntfy only
@@ -86,6 +86,13 @@ spec:
             except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10]
       ports:
         - {protocol: TCP, port: 443}     # web search (Exa)
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: travel}
+          podSelector:
+            matchLabels: {app: ntfy}
+      ports:
+        - {protocol: TCP, port: 80}      # approval requests
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

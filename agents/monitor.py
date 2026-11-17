@@ -15,6 +15,8 @@ from aiops.kube import KubeClient
 from aiops.metrics import METRICS
 from aiops.models import PodIssue
 
+from . import approval, outcomes
+
 log = logging.getLogger("agents.monitor")
 
 
@@ -53,6 +55,18 @@ class Monitor:
                 continue
             self.open_incident(issue, key, deployment_name, deployment, fp)
         self.prune(incidents)
+        self.bookkeeping()
+
+    def bookkeeping(self) -> None:
+        """Reject unanswered approval requests; copy finished Remediations into Outcomes."""
+        remediations = self.store.list("remediations")
+        if approval.expire_stale(self.store, remediations):
+            remediations = self.store.list("remediations")
+        stored = self.store.list("outcomes")
+        known = {o["metadata"]["name"] for o in stored}
+        outcomes.record(self.store, remediations, known)
+        outcomes.prune(self.store, stored, self.config.outcome_retention_days)
+        METRICS.set("aiops_outcomes", len(known))
 
     def _should_open(self, last: Optional[dict], fp: str = "") -> bool:
         if last is None:

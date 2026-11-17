@@ -1,10 +1,31 @@
-"""Read-only web console served by the monitor: Incidents and their Remediations."""
+"""Web console served by the monitor: Incidents, their Remediations and Outcomes.
+
+It is read-only except for one route: the approve / reject buttons in an
+approval notification POST to /api/approval/<remediation>?token=...&decision=...
+and only a matching one-time token moves that Remediation on.
+"""
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from aiops import crd
+
+from . import approval, outcomes
+
+_APPROVAL_PATH = re.compile(r"^/api/approval/([a-z0-9][a-z0-9.-]{0,252})$")
+
+
+def approval_post(store: crd.Store):
+    def handle(path: str, query: dict) -> tuple[int, str, bytes]:
+        m = _APPROVAL_PATH.match(path)
+        if not m or query.get("decision") not in ("approve", "reject") or not query.get("token"):
+            return 404, "text/plain; charset=utf-8", b"not found"
+        code, message = approval.decide(store, m.group(1), query["decision"] == "approve",
+                                        token=query["token"], who="ntfy")
+        return code, "text/plain; charset=utf-8", message.encode("utf-8")
+    return handle
 
 _CACHE_SECONDS = 3.0
 
@@ -36,8 +57,10 @@ def console_routes(store: crd.Store) -> dict:
             lessons = [{"name": l["metadata"]["name"], **{k: l["spec"].get(k) for k in
                         ("symptom", "target", "action", "params", "verifiedAt")}}
                        for l in store.list("lessons")]
+            summary = outcomes.summarize([o["spec"] for o in store.list("outcomes")])
             cache.update(at=time.time(), body=json.dumps(
-                {"incidents": incidents, "lessons": lessons}, ensure_ascii=False).encode("utf-8"))
+                {"incidents": incidents, "lessons": lessons, "outcomes": summary},
+                ensure_ascii=False).encode("utf-8"))
         return "application/json; charset=utf-8", cache["body"]
 
     return {"/": lambda: ("text/html; charset=utf-8", _PAGE.encode("utf-8")), "/api/state": state}
@@ -66,9 +89,11 @@ td, th { text-align:left; padding:5px 8px; border-bottom:1px solid var(--border)
 <h1>AIOps v2 — incidents</h1>
 <p class="sub">monitor → diagnose → repair → validate, handed over as Kubernetes resources · refreshes every 10 s</p>
 <div id="list"></div><h2>Lessons (verified fixes)</h2><table id="lessons"></table>
+<h2>Outcomes (scores vs. what happened)</h2><table id="outcomes"></table><p class="sub" id="brier"></p>
 </main><script>
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const COLOR = {Resolved:"var(--good)", Validated:"var(--good)", Unresolved:"var(--warn)", Recommended:"var(--warn)",
+  AwaitingApproval:"var(--accent)",
   Rejected:"var(--warn)", RolledBack:"var(--bad)", Failed:"var(--bad)"};
 const badge = (p) => `<span class="badge"><i style="background:${COLOR[p] || "var(--accent)"}"></i>${esc(p)}</span>`;
 async function load() {
@@ -85,6 +110,11 @@ async function load() {
   document.getElementById("lessons").innerHTML = "<tr><th>workload</th><th>symptom</th><th>fix</th><th>verified</th></tr>" +
     st.lessons.map((l) => `<tr><td>${esc(l.target.namespace)}/${esc(l.target.deployment)}</td><td>${esc(l.symptom)}</td>
       <td>${esc(l.action)} ${esc(JSON.stringify(l.params))}</td><td>${esc(new Date(l.verifiedAt).toLocaleString())}</td></tr>`).join("");
+  const o = st.outcomes;
+  document.getElementById("outcomes").innerHTML = "<tr><th>source</th><th>total</th><th>applied</th><th>worked</th></tr>" +
+    Object.entries(o.bySource).map(([s, c]) => `<tr><td>${esc(s)}</td><td>${c.total}</td><td>${c.applied}</td><td>${c.worked}</td></tr>`).join("");
+  document.getElementById("brier").textContent = `${o.llmApplied} applied LLM fixes` +
+    (o.llmBrier === null ? "" : ` · Brier score of the LLM's confidence ${o.llmBrier} (lower is better)`);
 }
 load(); setInterval(load, 10000);
 </script></body></html>

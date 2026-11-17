@@ -104,6 +104,11 @@ spec:
                 evaluation:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
+                approval:
+                  type: object
+                  properties:
+                    tokenHash: {type: string}
+                    expiresAt: {type: string}
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
@@ -144,3 +149,39 @@ spec:
                   properties:
                     namespace: {type: string}
                     deployment: {type: string}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: outcomes.aiops.homelab.dev
+spec:
+  group: aiops.homelab.dev
+  scope: Namespaced
+  names:
+    kind: Outcome
+    plural: outcomes
+    singular: outcome
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - {name: Workload, type: string, jsonPath: .spec.target.deployment}
+        - {name: Source, type: string, jsonPath: .spec.source}
+        - {name: Action, type: string, jsonPath: .spec.action}
+        - {name: Confidence, type: number, jsonPath: .spec.confidence}
+        - {name: Result, type: string, jsonPath: .spec.result}
+        - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [remediation, source, result]
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                remediation: {type: string}
+                source: {type: string}
+                result: {type: string, enum: [validated, rolled_back, rejected, recommended]}
+                confidence: {type: number, nullable: true}

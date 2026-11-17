@@ -150,6 +150,15 @@ spec:
               value: "true"
             - name: AIOPS_LLM_AUTO_FIX
               value: "true"
+            # Tiered automation: LLM fixes wait for "Approve" on an ntfy notification.
+            - name: AIOPS_APPROVAL_SOURCES
+              value: "llm"
+            - name: AIOPS_APPROVAL_TTL
+              value: "3600"
+            - name: AIOPS_APPROVAL_NTFY
+              value: "http://ntfy.travel.svc.cluster.local/aiops-approvals"
+            - name: AIOPS_CONSOLE_URL      # the approve buttons POST here from the phone
+              value: "http://aiops.USER-TAILSCALE-IP.sslip.io:8000"
           ports:
             - name: http
               containerPort: 8080

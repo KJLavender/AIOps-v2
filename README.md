@@ -18,6 +18,8 @@ In v2 each agent runs as its own pod with its own Kubernetes ServiceAccount (an 
 - The agent that changes the cluster has no route to the internet. It never applies a change someone else wrote. It rebuilds the change itself.
 - Logs are cleaned of secrets before any other agent sees them, so they cannot leak into a web search.
 - Every step is a Kubernetes object with a history. You can read it with `kubectl get incidents,remediations,lessons`.
+- A fix the LLM came up with waits for a person to tap "Approve" on a phone notification. Rules and fixes that already worked on that workload run on their own.
+- Every finished fix is copied into an Outcome with its scores and what really happened, so the LLM's confidence can be checked against reality over time.
 - Diagnosis and validation run in worker pools, so one slow fix does not block the others.
 - An issue that could not be fixed is looked at again only when the workload changes (its Deployment generation changes), or after 6 hours.
 
@@ -36,6 +38,7 @@ sequenceDiagram
     M->>M: Incident {evidence: redacted logs, events, container spec}
     D->>D: rules → Lessons → web search + guard → LLM → judge
     D->>D: Remediation {action, params, autoApply}
+    Note over D,R: an LLM fix waits in AwaitingApproval until a person taps Approve (ntfy)
     R->>K: get live Deployment
     R->>R: rebuild patch from catalog, re-check allowlists, pre-check pod
     R->>K: kubectl patch
@@ -61,7 +64,7 @@ This is the history of one real fix, taken from `status.history` of a Remediatio
 
 | Agent | What it does | Kubernetes rights (in watched namespaces) | Network |
 | --- | --- | --- | --- |
-| monitor | Finds failing pods, saves cleaned-up evidence, opens Incidents, removes old ones, serves a read-only web console | Read pods, logs, events, Deployments, ReplicaSets | Kubernetes API only |
+| monitor | Finds failing pods, saves cleaned-up evidence, opens Incidents, removes old ones, records Outcomes, serves the web console and takes the approve / reject answers | Read pods, logs, events, Deployments, ReplicaSets | Kubernetes API only |
 | diagnose | Tries rules, then past Lessons, then a guarded web search, then the LLM, then a judge. Writes a Remediation proposal | None | API, Ollama, internet on port 443 |
 | repair | Rebuilds the change from the list of allowed actions against the live Deployment, checks it, patches it. Rolls back fixes that fail | Get and patch Deployments, read ReplicaSets and pods | API and pod network (for the pre-check). No internet |
 | validate | Waits for the rollout, checks the pod is Running, Ready and stable, records Lessons | Read Deployments, ReplicaSets, pods | API only |
@@ -75,8 +78,9 @@ These are custom resources (CRDs, objects you define yourself). The group is `ai
 | Kind | Created by | Phases |
 | --- | --- | --- |
 | `Incident` | monitor | `Open`, `Diagnosing`, `Proposed`, `Remediating`, then `Resolved` or `Unresolved` |
-| `Remediation` | diagnose (owned by its Incident) | `Proposed` or `Recommended`, then `Applying`, `Applied`, then `Validated` or `Failed`, then `RolledBack`; or `Rejected` |
+| `Remediation` | diagnose (owned by its Incident) | `AwaitingApproval` (LLM fixes), `Proposed` or `Recommended`, then `Applying`, `Applied`, then `Validated` or `Failed`, then `RolledBack`; or `Rejected` |
 | `Lesson` | validate (one per workload and symptom) | none |
+| `Outcome` | monitor (one per finished Remediation, kept 365 days) | none |
 
 ```console
 $ kubectl get incidents,remediations,lessons -n aiops-system
@@ -106,6 +110,7 @@ These permissions were checked on a running cluster with `kubectl auth can-i` an
 | validate | no | no | no | no | no |
 
 - RBAC (Kubernetes permissions): one ServiceAccount per agent, with namespaced Roles only. [`deploy/generate_rbac.py`](deploy/generate_rbac.py) holds the table and generates `deploy/10-rbac.yaml`. No agent can read Secrets, delete workloads, or touch `kube-system` or `monitoring`.
+- The monitor can change one thing: the status of a Remediation that waits for approval (approve, reject, or expire it). It cannot touch workloads, and repair still re-checks everything after an approval.
 - NetworkPolicy (firewall rules for pods): everything in `aiops-system` is denied by default, then each agent gets the traffic it needs ([`deploy/30-networkpolicy.yaml`](deploy/30-networkpolicy.yaml)).
 - Evidence cleaning: passwords, tokens, bearer and basic auth headers, AWS keys, GitHub tokens, JWTs and `user:pass@` URLs are removed from logs and events. Environment variable values are never copied, only their names.
 - No patch is handed over. A Remediation holds an `action` and its `params`, never a patch. The repair agent builds the patch from the live Deployment using the list of allowed actions. A tampered proposal such as `set_image: evil/miner` is refused.
@@ -118,6 +123,33 @@ These permissions were checked on a running cluster with `kubectl auth can-i` an
 4. Live pre-check (repair): a new probe path must answer 2xx or 3xx on a running pod before the patch is applied.
 5. Validation and rollback: the pod must be Running, Ready and stable, or the change is undone with `rollout undo`. A fix that was rolled back is never proposed or applied again.
 6. Lessons: only fixes that passed validation are reused, and only for the same workload.
+7. Human approval: a fix from the LLM is only applied after a person approves it. See below.
+
+### Human approval
+
+Fixes come from three places, and each gets a different level of trust:
+
+| Source | What happens |
+| --- | --- |
+| Fixed rule | Applied automatically |
+| Lesson (this exact fix already worked on this workload) | Applied automatically |
+| LLM | Passes every check above, then waits in `AwaitingApproval` |
+
+While it waits, diagnose sends an ntfy notification to the `aiops-approvals` topic with the target, the change, the confidence and the judge's scores, and two buttons. Each button sends a POST to the monitor console with a one-time token. Only the token's SHA-256 is stored on the Remediation, so reading the cluster objects is not enough to approve anything. A wrong token gets 403, a second answer gets 409, and a request nobody answers is rejected after an hour (`AIOPS_APPROVAL_TTL`).
+
+Approving only moves the Remediation to `Proposed`. repair still rebuilds the patch from the live Deployment and runs the pre-check, so a person saying yes never skips a check. Without a phone you can answer from a terminal: `python -m agents.approval <remediation> approve` (or `reject`).
+
+Once the same fix has been approved and validated on a workload, it becomes a Lesson, and the next time it is applied without asking. Trust is earned per workload.
+
+A real run on the cluster:
+
+```
+18:16:49  AwaitingApproval  Change app readiness probe path /healthz -> / (LLM + web)   <- diagnose
+18:18:45  Proposed          approved by a human (ntfy)                                  <- monitor
+18:18:50  Applying          re-checking the proposal against the live cluster           <- repair
+18:18:52  Applied           Change app readiness probe path /healthz -> /               <- repair
+18:19:24  Validated         Running & Ready & stable                                     <- validate
+```
 
 ### About the confidence and judge scores
 
@@ -125,7 +157,11 @@ The LLM reports a confidence for its answer, and the judge gives three scores. B
 
 So the thresholds (`AIOPS_LLM_MIN_CONFIDENCE`, `AIOPS_LLM_AUTO_FIX_MIN_CONFIDENCE`, `AIOPS_JUDGE_MIN_SCORE`) only drop answers the model itself is unsure about. What stops a bad change are the checks that don't depend on the LLM: the action list and its parameter checks, the evidence check, the live pre-check, and validation with rollback.
 
-Calibrating the scores (for example with Platt scaling or isotonic regression) needs many past decisions with known outcomes. A home lab doesn't have enough of them yet.
+Calibrating the scores (for example with Platt scaling or isotonic regression) needs many past decisions with known outcomes. A home lab doesn't have enough of them yet, so the agents now collect them:
+
+- Every finished Remediation is copied into an `Outcome`: source, action, confidence, judge scores, whether a person was asked, and the result (`validated`, `rolled_back`, `rejected` or `recommended`). Outcomes are kept for 365 days, long after the Incident is deleted.
+- `python -m agents.outcomes` prints how often fixes worked per source, how often applied LLM fixes worked in each confidence band, and the Brier score of the LLM's confidence (0 is perfect, lower is better). The console shows the same summary.
+- The nightly simulation also reports a Brier score per prompt variant: for each case where the LLM proposed a fix, its confidence against whether that fix was acceptable.
 
 ## Metrics and dashboard
 
@@ -192,12 +228,16 @@ All agents read the same set of environment variables.
 | `AIOPS_AUTO_FIX` / `AIOPS_DRY_RUN` | `true` / `false` | repair | Apply fixes, or only record them |
 | `AIOPS_ACTION_PRECHECK` / `AIOPS_MAX_MEMORY` | `true` / `2Gi` | repair | Pre-check; memory cap |
 | `AIOPS_VALIDATION_TIMEOUT` / `AIOPS_STABILITY` | `300` / `60` | validate | Seconds to wait for the rollout; seconds it must stay stable |
+| `AIOPS_APPROVAL_SOURCES` | `llm` | diagnose | Fix sources that need a person's approval (comma list, empty = none) |
+| `AIOPS_APPROVAL_TTL` | `3600` | diagnose | Seconds before an unanswered request is rejected |
+| `AIOPS_APPROVAL_NTFY` / `AIOPS_CONSOLE_URL` | none | diagnose | ntfy topic URL for requests; the console address the phone's buttons call |
+| `AIOPS_OUTCOME_RETENTION_DAYS` | `365` | monitor | How long Outcomes are kept |
 
 ## Tests
 
 ```bash
 pip install pytest
-pytest -q                                   # 76 tests, no cluster or network needed, about 0.1 s
+pytest -q                                   # 86 tests, no cluster or network needed, about 1 s
 python -m agents.simulate --variants oracle                   # scripted answers, no Ollama needed
 python -m agents.simulate --variants default,evidence-first   # needs Ollama
 ```
@@ -220,9 +260,10 @@ The `aiops-eval` CronJob runs `default`, `evidence-first` and `oracle` every nig
 
 ```
 agents/      monitor.py  diagnose.py  repair.py  validate.py  console.py  simulate.py
+             approval.py (human approval)  outcomes.py (scores vs. results)
 aiops/       shared code: rules/, llm/, actions.py (allowed actions), guard.py, judge.py,
              websearch.py, evidence.py (capture and cleaning), crd.py (object store), metrics.py
-crds/        Incident, Remediation, Lesson
+crds/        Incident, Remediation, Lesson, Outcome
 deploy/      namespace, RBAC (generated), agents, NetworkPolicies, eval CronJob, dashboard
 tests/       agent hand-over tests, and the shared-code tests from v1
 ```
@@ -231,8 +272,9 @@ tests/       agent hand-over tests, and the shared-code tests from v1
 
 - Each agent runs as a single replica. There is no leader election. Restarts are safe because of the phases, but two replicas of the same role would race each other.
 - Agents poll with `kubectl` instead of using watches. This is simple and needs no libraries, and is fine for a home lab.
-- The confidence and judge scores are not calibrated. See [About the confidence and judge scores](#about-the-confidence-and-judge-scores).
-- Not built yet: a human approval step for LLM-proposed fixes, leader election, OpenTelemetry traces, and more allowed actions.
+- The confidence and judge scores are not calibrated yet. Outcomes are being collected for it. See [About the confidence and judge scores](#about-the-confidence-and-judge-scores).
+- The approve buttons work from devices on your Tailscale network. The console has no login, so don't expose it publicly.
+- Not built yet: leader election, OpenTelemetry traces, and more allowed actions.
 
 ## License
 

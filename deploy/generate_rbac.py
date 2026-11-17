@@ -4,7 +4,7 @@
 
 | agent    | aiops-system (CRDs)                           | watched namespaces            |
 |----------|-----------------------------------------------|-------------------------------|
-| monitor  | create Incidents, read Remediations/Lessons    | read pods, logs, events, apps |
+| monitor  | create Incidents, read Lessons, answer approvals (Remediation status), write Outcomes | read pods, logs, events, apps |
 | diagnose | read Incidents, create Remediations, read Lessons | nothing                   |
 | repair   | update Remediations/Incidents                 | patch Deployments, read RS/pods |
 | validate | update Remediations/Incidents, write Lessons   | read Deployments, RS, pods    |
@@ -19,7 +19,9 @@ SYSTEM_RULES = {
     "monitor": [
         ([G], ["incidents"], ["get", "list", "create", "delete"]),
         ([G], ["incidents/status"], ["get", "patch"]),
-        ([G], ["remediations", "lessons"], ["get", "list"]),  # read-only console
+        ([G], ["remediations", "lessons"], ["get", "list"]),  # console
+        ([G], ["remediations/status"], ["get", "patch"]),  # approve / reject / expire only
+        ([G], ["outcomes"], ["get", "list", "create", "delete"]),
     ],
     "diagnose": [
         ([G], ["incidents"], ["get", "list"]),

@@ -29,6 +29,8 @@ from aiops.rules import RuleEngine
 from aiops.rules.base import RuleContext
 from aiops.websearch import WebSearch, generalize
 
+from . import approval
+
 log = logging.getLogger("agents.diagnose")
 
 
@@ -218,15 +220,20 @@ class DiagnoseAgent:
         rem_spec, trace = self.decider.decide(inc["spec"], self.store.list("lessons"),
                                               self.store.list("remediations"))
         auto = rem_spec["autoApply"]
+        token = None
+        if auto and approval.needs_approval(self.config, rem_spec["source"]):
+            token, rem_spec["approval"] = approval.new_request(self.config)
+        rem_phase = crd.AWAITING_APPROVAL if token else crd.PROPOSED if auto else crd.RECOMMENDED
         rem = self.store.create(
             "Remediation", rem_spec, name=inc["metadata"]["name"], owner=inc,
             labels={f"{crd.GROUP}/namespace": rem_spec["target"]["namespace"],
                     f"{crd.GROUP}/source": rem_spec["source"]},
-            status={"phase": crd.PROPOSED if auto else crd.RECOMMENDED,
-                    "message": rem_spec["summary"][:300]})
-        self.store.set_status(inc, crd.PROPOSED if auto else crd.UNRESOLVED,
-                              ("fix proposed: " if auto else "recommendation: ") + rem_spec["summary"][:200],
+            status={"phase": rem_phase, "message": rem_spec["summary"][:300]})
+        prefix = "waiting for approval: " if token else "fix proposed: " if auto else "recommendation: "
+        self.store.set_status(inc, crd.PROPOSED if auto else crd.UNRESOLVED, prefix + rem_spec["summary"][:200],
                               remediation=rem["metadata"]["name"])
+        if token:
+            approval.notify(self.config, rem, token)
         METRICS.inc("aiops_remediations_proposed_total", source=rem_spec["source"],
                     auto="true" if auto else "false")
         if trace:
