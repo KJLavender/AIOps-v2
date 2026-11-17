@@ -35,7 +35,7 @@ spec:
               image: aiops-v2:local
               imagePullPolicy: Never
               command: ["python", "-m", "agents.simulate",
-                        "--variants", "default,evidence-first",
+                        "--variants", "default,evidence-first,oracle",
                         "--notify", "http://ntfy.travel.svc.cluster.local/aiops"]
               env:
                 - name: AIOPS_OLLAMA_ENDPOINT

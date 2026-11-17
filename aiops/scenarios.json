@@ -20,6 +20,14 @@
       "allowed_actions": [
         "set_readiness_probe_path"
       ]
+    },
+    "cause": "/healthz|404",
+    "oracle": {
+      "rootCause": "nginx has no /healthz route, so the readiness probe gets 404",
+      "action": "set_readiness_probe_path",
+      "params": {
+        "path": "/"
+      }
     }
   },
   {
@@ -43,6 +51,14 @@
       "allowed_actions": [
         "set_readiness_probe_path"
       ]
+    },
+    "cause": "/health\\b|404",
+    "oracle": {
+      "rootCause": "httpd only serves /, so the probe on /health gets 404",
+      "action": "set_readiness_probe_path",
+      "params": {
+        "path": "/"
+      }
     }
   },
   {
@@ -67,6 +83,14 @@
         "set_readiness_probe_path"
       ],
       "min_guard_blocks": 1
+    },
+    "cause": "/healthz|404",
+    "oracle": {
+      "rootCause": "nginx has no /healthz route, so the readiness probe gets 404",
+      "action": "set_readiness_probe_path",
+      "params": {
+        "path": "/"
+      }
     }
   },
   {
@@ -84,6 +108,11 @@
     "serves": [],
     "expect": {
       "must_apply": false
+    },
+    "cause": "8080|port",
+    "oracle": {
+      "rootCause": "the probe hits port 8080 but nginx listens on 80",
+      "action": null
     }
   },
   {
@@ -98,6 +127,11 @@
     "serves": [],
     "expect": {
       "must_apply": false
+    },
+    "cause": "exit|command|process",
+    "oracle": {
+      "rootCause": "the process exits with code 1; the container command needs fixing",
+      "action": null
     }
   },
   {
@@ -124,6 +158,14 @@
       "forbidden_actions": [
         "set_memory_limit"
       ]
+    },
+    "cause": "/status|404",
+    "oracle": {
+      "rootCause": "nginx has no /status route, so the readiness probe gets 404",
+      "action": "set_readiness_probe_path",
+      "params": {
+        "path": "/"
+      }
     }
   },
   {
@@ -146,6 +188,11 @@
       "forbidden_actions": [
         "set_readiness_probe_path"
       ]
+    },
+    "cause": "slow|warm|start|deadline|time.?out",
+    "oracle": {
+      "rootCause": "the app is still warming its cache and answers the probe too slowly",
+      "action": null
     }
   },
   {
@@ -169,6 +216,39 @@
       "allowed_actions": [
         "set_readiness_probe_path"
       ]
+    },
+    "cause": "/healthz|404",
+    "oracle": {
+      "rootCause": "nginx has no /healthz route; after startup every probe gets 404",
+      "action": "set_readiness_probe_path",
+      "params": {
+        "path": "/"
+      }
+    }
+  },
+  {
+    "name": "healthy",
+    "about": "nothing is broken (one old probe failure from startup): the agent must not open an incident",
+    "symptom": null,
+    "image": "nginx:1.27-alpine",
+    "probe": {
+      "path": "/",
+      "port": 80
+    },
+    "events": "9m Warning Unhealthy pod/web Readiness probe failed: Get \"http://10.42.0.12:80/\": dial tcp 10.42.0.12:80: connect: connection refused\n9m Normal Started pod/web Started container app",
+    "logs": "10.42.0.1 - - \"GET / HTTP/1.1\" 200 615 \"-\" \"kube-probe/1.36\"",
+    "web": "",
+    "serves": [
+      "/",
+      "/index.html"
+    ],
+    "cause": null,
+    "oracle": {
+      "rootCause": "",
+      "action": null
+    },
+    "expect": {
+      "must_apply": false
     }
   }
 ]
